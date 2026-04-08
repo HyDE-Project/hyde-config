@@ -19,13 +19,14 @@ import (
 )
 
 type Config struct {
-	ConfigFile string
-	EnvFile    string
-	HyprFile   string
-	NoDaemon   bool
-	NoExport   bool
-	Verbose    bool
-	Debug      bool
+	ConfigFile  string
+	EnvFile     string
+	HyprFile    string
+	HyprEnvFile string
+	NoDaemon    bool
+	NoExport    bool
+	Verbose     bool
+	Debug       bool
 }
 
 type TomlMap map[string]interface{}
@@ -51,6 +52,8 @@ func main() {
 		"The output environment file. Default is $XDG_STATE_HOME/hyde/config")
 	flag.StringVar(&config.HyprFile, "hypr", filepath.Join(xdg.StateHome, "hyde", "hyprland.conf"),
 		"The output Hyprland file. Default is $XDG_STATE_HOME/hyde/hyprland.conf")
+	flag.StringVar(&config.HyprEnvFile, "hypr-env", filepath.Join(xdg.StateHome, "hyde", "hypr.conf"),
+		"The output Hyprland env variables file. Default is $XDG_STATE_HOME/hyde/hypr.conf")
 	flag.BoolVar(&config.NoDaemon, "no-daemon", false, "Run in one-off mode without watching for changes (daemon mode is default)")
 	flag.BoolVar(&config.NoExport, "no-export", false, "Disable exporting the parsed data (export is default)")
 	flag.BoolVar(&config.Verbose, "verbose", false, "Enable verbose logging")
@@ -68,12 +71,14 @@ func main() {
 	logInfo("Using config file: %s", config.ConfigFile)
 	logInfo("Using env output file: %s", config.EnvFile)
 	logInfo("Using hypr output file: %s", config.HyprFile)
+	logInfo("Using hypr env output file: %s", config.HyprEnvFile)
 	logInfo("Export mode: %v", !config.NoExport)
 	logInfo("Daemon mode: %v", !config.NoDaemon)
 	logInfo("Debug mode: %v", config.Debug)
 
 	ensureDirExists(filepath.Dir(config.EnvFile))
 	ensureDirExists(filepath.Dir(config.HyprFile))
+	ensureDirExists(filepath.Dir(config.HyprEnvFile))
 
 	if noStartup {
 		logInfo("--no-startup: Only parsing config and reporting errors, not populating configs on startup")
@@ -92,9 +97,9 @@ func main() {
 
 	if !config.NoDaemon {
 		logInfo("Starting daemon mode, watching %s for changes", config.ConfigFile)
-		watchFile(config.ConfigFile, config.EnvFile, config.HyprFile, !config.NoExport)
+		watchFile(config.ConfigFile, config.EnvFile, config.HyprFile, config.HyprEnvFile, !config.NoExport)
 	} else if !noStartup {
-		parseConfigFiles(config.ConfigFile, config.EnvFile, config.HyprFile, !config.NoExport)
+		parseConfigFiles(config.ConfigFile, config.EnvFile, config.HyprFile, config.HyprEnvFile, !config.NoExport)
 		logInfo("Running in one-off mode (no watching for changes)")
 	}
 }
@@ -105,7 +110,7 @@ func ensureDirExists(dir string) {
 	}
 }
 
-func parseConfigFiles(tomlFile, envFile, hyprFile string, exportMode bool) bool {
+func parseConfigFiles(tomlFile, envFile, hyprFile, hyprEnvFile string, exportMode bool) bool {
 
 	fileInfo, err := os.Stat(tomlFile)
 	if err != nil {
@@ -131,9 +136,9 @@ func parseConfigFiles(tomlFile, envFile, hyprFile string, exportMode bool) bool 
 	logDebug("TOML content loaded successfully, size of map: %d", len(tomlContent))
 
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 
-	var success1, success2 bool
+	var success1, success2, success3 bool
 
 	go func() {
 		defer wg.Done()
@@ -145,9 +150,14 @@ func parseConfigFiles(tomlFile, envFile, hyprFile string, exportMode bool) bool 
 		success2 = parseTomlToHyprWithContent(tomlContent, hyprFile)
 	}()
 
+	go func() {
+		defer wg.Done()
+		success3 = parseTomlToHyprEnvWithContent(tomlContent, hyprEnvFile)
+	}()
+
 	wg.Wait()
 
-	success := success1 && success2
+	success := success1 && success2 && success3
 
 	if success && !config.NoDaemon && !isInitialStartup {
 		sendSuccessNotification("Hyde Config", "Configuration reloaded successfully")
@@ -474,6 +484,94 @@ func flattenHyprDict(data TomlMap, parentKey string, result *HyprVars) {
 	}
 }
 
+func parseTomlToHyprEnvWithContent(tomlContent TomlMap, hyprEnvFile string) bool {
+	if len(tomlContent) == 0 {
+		logError("Cannot parse empty TOML content for Hyprland env vars")
+		return false
+	}
+
+	ignoredKeys := map[string]bool{
+		"$schema":        true,
+		"$SCHEMA":        true,
+		"hyprland":       true,
+		"hyprland-ipc":   true,
+		"hyprland-env":   true,
+		"hyprland-start": true,
+	}
+
+	hyprEnvVars := make(HyprVars, 0, len(tomlContent)*2+2)
+	hyprEnvVars = append(hyprEnvVars, "# hyprlang noerror true")
+	flattenToHyprVars(tomlContent, "", ignoredKeys, &hyprEnvVars)
+	hyprEnvVars = append(hyprEnvVars, "# hyprlang noerror false")
+
+	if len(hyprEnvVars) <= 2 {
+		logError("No Hyprland env variables generated, skipping file write")
+		return false
+	}
+
+	logDebug("Generated %d Hyprland env variable lines", len(hyprEnvVars))
+
+	if hyprEnvFile != "" {
+		tempFile := fmt.Sprintf("%s.tmp.%d.%d", hyprEnvFile, os.Getpid(), time.Now().UnixNano())
+		if err := writeLinesToFile(tempFile, hyprEnvVars); err != nil {
+			logError("Failed to write Hyprland env variables to temp file: %v", err)
+			return false
+		}
+
+		if err := os.Rename(tempFile, hyprEnvFile); err != nil {
+			logError("Failed to replace Hyprland env file: %v", err)
+			os.Remove(tempFile)
+			return false
+		}
+
+		logInfo("Hyprland env variables have been written to %s", hyprEnvFile)
+		return true
+	} else {
+		logInfo("No hypr-env file specified.")
+		for _, line := range hyprEnvVars {
+			logInfo("%s", line)
+		}
+		return true
+	}
+}
+
+func flattenToHyprVars(data TomlMap, parentKey string, ignoredKeys map[string]bool, result *HyprVars) {
+	for k, v := range data {
+		if ignoredKeys[k] || strings.HasPrefix(k, "hyprland") || strings.HasPrefix(parentKey, "hyprland") {
+			logDebug("Skipping key for hypr-env: %s", k)
+			continue
+		}
+
+		if strings.HasPrefix(k, "$") {
+			continue
+		}
+
+		var newKey string
+		if parentKey != "" {
+			newKey = fmt.Sprintf("%s_%s", parentKey, strings.ToUpper(k))
+		} else {
+			newKey = strings.ToUpper(k)
+		}
+
+		switch val := v.(type) {
+		case map[string]interface{}:
+			flattenToHyprVars(TomlMap(val), newKey, ignoredKeys, result)
+		case []interface{}:
+			arrayItems := make([]string, 0, len(val))
+			for _, item := range val {
+				arrayItems = append(arrayItems, fmt.Sprintf("%v", item))
+			}
+			*result = append(*result, fmt.Sprintf("$%s = %s", newKey, strings.Join(arrayItems, ", ")))
+		case bool:
+			*result = append(*result, fmt.Sprintf("$%s = %t", newKey, val))
+		case int64, float64:
+			*result = append(*result, fmt.Sprintf("$%s = %v", newKey, val))
+		default:
+			*result = append(*result, fmt.Sprintf("$%s = %v", newKey, val))
+		}
+	}
+}
+
 func writeLinesToFile(filename string, lines []string) error {
 	if len(lines) == 0 {
 		return fmt.Errorf("no lines to write")
@@ -513,7 +611,7 @@ var (
 	lastMod      time.Time
 )
 
-func watchFile(tomlFile, envFile, hyprFile string, exportMode bool) {
+func watchFile(tomlFile, envFile, hyprFile, hyprEnvFile string, exportMode bool) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		logError("Failed to create file watcher: %v", err)
@@ -570,7 +668,7 @@ func watchFile(tomlFile, envFile, hyprFile string, exportMode bool) {
 
 					time.Sleep(50 * time.Millisecond)
 
-					parseConfigFiles(tomlFile, envFile, hyprFile, exportMode)
+					parseConfigFiles(tomlFile, envFile, hyprFile, hyprEnvFile, exportMode)
 				} else {
 					logDebug("Skipping event, within debounce interval")
 				}

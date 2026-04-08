@@ -24,7 +24,6 @@ git clone https://github.com/hyde-project/hyde-config.git
 cd hyde-config
 
 # Build the application
-make deps
 make build
 
 # Install the application
